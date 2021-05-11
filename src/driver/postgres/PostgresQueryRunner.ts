@@ -205,24 +205,21 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
 
         this.driver.connection.logger.logQuery(query, parameters, this);
         try {
-            const queryStartTime = +new Date();
+            const queryStartTime = Date.now();
             const result = await databaseConnection.query(query, parameters);
             // log slow queries if maxQueryExecution time is set
             const maxQueryExecutionTime = this.driver.connection.options.maxQueryExecutionTime;
-            const queryEndTime = +new Date();
+            const queryEndTime = Date.now();
             const queryExecutionTime = queryEndTime - queryStartTime;
             if (maxQueryExecutionTime && queryExecutionTime > maxQueryExecutionTime)
                 this.driver.connection.logger.logQuerySlow(queryExecutionTime, query, parameters, this);
 
-            switch (result.command) {
-                case "DELETE":
-                case "UPDATE":
-                    // for UPDATE and DELETE query additionally return number of affected rows
-                    return [result.rows, result.rowCount];
-                    break;
-                default:
-                    return result.rows;
+            if (["DELETE", "UPDATE"].includes(result.command)) {
+                // for UPDATE and DELETE query additionally return number of affected rows
+                return [result.rows, result.rowCount];
             }
+
+            return result.rows;
         } catch (err) {
             this.driver.connection.logger.logQueryError(err, query, parameters, this);
             throw new QueryFailedError(query, parameters, err);
@@ -282,6 +279,34 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
         const query = await this.query(`SELECT * FROM current_database()`);
         return query[0]["current_database"];
     }
+
+    /**
+     * Retrieves current Postgres version
+     */
+    async getCurrentVersion(): Promise<string> {
+        const query = await this.query(`SHOW server_version_num;`);
+        return query[0]["server_version_num"];
+    }
+
+    /**
+     * Validates current Postgres version
+     *
+     * version: 12.4 will be 120004 / 9.2.9 will be 90209
+     */
+    async hasCurrentVersion(version: number): Promise<boolean> {
+        const query = await this.query(`SHOW server_version_num;`);
+        return Number(query[0]["server_version_num"]) >= version;
+    }
+
+    /**
+     * It was implemented in Postgres 9.1
+     *
+     * https://www.postgresql.org/docs/current/sql-createtable.html
+     */
+    async hasIfNotExists(): Promise<boolean> {
+        return this.hasCurrentVersion(90100);
+    }
+
 
     /**
      * Checks if schema with the given name exist.
@@ -369,7 +394,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
      * Creates a new table.
      */
     async createTable(table: Table, ifNotExist: boolean = false, createForeignKeys: boolean = true, createIndices: boolean = true): Promise<void> {
-        if (ifNotExist) {
+        if (ifNotExist && !this.hasIfNotExists()) {
             const isTableExist = await this.hasTable(table);
             if (isTableExist) return Promise.resolve();
         }
@@ -377,16 +402,16 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
         const downQueries: Query[] = [];
 
         // if table have column with ENUM type, we must create this type in postgres.
-        const enumColumns = table.columns.filter(column => column.type === "enum" || column.type === "simple-enum")
-        const createdEnumTypes: string[] = []
+        const enumColumns = table.columns.filter(column => column.type === "enum" || column.type === "simple-enum");
+        const createdEnumTypes: string[] = [];
         for (const column of enumColumns) {
             // TODO: Should also check if values of existing type matches expected ones
             const hasEnum = await this.hasEnumType(table, column);
-            const enumName = this.buildEnumName(table, column)
+            const enumName = this.buildEnumName(table, column);
 
             // if enum with the same "enumName" is defined more then once, me must prevent double creation
             if (!hasEnum && createdEnumTypes.indexOf(enumName) === -1) {
-                createdEnumTypes.push(enumName)
+                createdEnumTypes.push(enumName);
                 upQueries.push(this.createEnumTypeSql(table, column, enumName));
                 downQueries.push(this.dropEnumTypeSql(table, column, enumName));
             }
@@ -674,7 +699,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
         let clonedTable = table.clone();
         const upQueries: Query[] = [];
         const downQueries: Query[] = [];
-        let defaultValueChanged = false
+        let defaultValueChanged = false;
 
         const oldColumn = oldTableColumnOrName instanceof TableColumn
             ? oldTableColumnOrName
@@ -829,7 +854,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
                 // if column have default value, we must drop it to avoid issues with type casting
                 if (oldColumn.default !== null && oldColumn.default !== undefined) {
                     // mark default as changed to prevent double update
-                    defaultValueChanged = true
+                    defaultValueChanged = true;
                     upQueries.push(new Query(`ALTER TABLE ${this.escapePath(table)} ALTER COLUMN "${oldColumn.name}" DROP DEFAULT`));
                     downQueries.push(new Query(`ALTER TABLE ${this.escapePath(table)} ALTER COLUMN "${oldColumn.name}" SET DEFAULT ${oldColumn.default}`));
                 }
@@ -1443,7 +1468,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
         if (!hasTable)
             return Promise.resolve([]);
 
-        const currentSchema = await this.getCurrentSchema()
+        const currentSchema = await this.getCurrentSchema();
         const viewsCondition = viewNames.map(viewName => {
             let [schema, name] = viewName.split(".");
             if (!name) {
@@ -1478,7 +1503,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
         if (!tableNames || !tableNames.length)
             return [];
 
-        const currentSchema = await this.getCurrentSchema()
+        const currentSchema = await this.getCurrentSchema();
 
         const tablesCondition = tableNames.map(tableName => {
             let [schema, name] = tableName.split(".");
@@ -1592,7 +1617,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
             const getSchemaFromKey = (dbObject: any, key: string) => {
                 return dbObject[key] === currentSchema && (!this.driver.options.schema || this.driver.options.schema === currentSchema)
                     ? undefined
-                    : dbObject[key]
+                    : dbObject[key];
             };
             // We do not need to join schema name, when database is by default.
             // In this case we need local variable `tableFullName` for below comparison.
@@ -1644,10 +1669,10 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
 
                     if (tableColumn.type.indexOf("enum") !== -1) {
                         // check if `enumName` is specified by user
-                        const { enumTypeName } = await this.getEnumTypeName(table, tableColumn)
-                        const builtEnumName = this.buildEnumName(table, tableColumn, false, true)
+                        const { enumTypeName } = await this.getEnumTypeName(table, tableColumn);
+                        const builtEnumName = this.buildEnumName(table, tableColumn, false, true);
                         if (builtEnumName !== enumTypeName)
-                            tableColumn.enumName = enumTypeName
+                            tableColumn.enumName = enumTypeName;
 
                         tableColumn.type = "enum";
                         const sql = `SELECT "e"."enumlabel" AS "value" FROM "pg_enum" "e" ` +
@@ -1724,7 +1749,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
                             tableColumn.isGenerated = true;
                             tableColumn.generationStrategy = "uuid";
                         } else if (dbColumn["column_default"] === "now()" || dbColumn["column_default"].indexOf("'now'::text") !== -1) {
-                            tableColumn.default = dbColumn["column_default"]
+                            tableColumn.default = dbColumn["column_default"];
                         } else {
                             tableColumn.default = dbColumn["column_default"].replace(/::.*/, "");
                             tableColumn.default = tableColumn.default.replace(/^(-?\d+)$/, "'$1'");
@@ -1835,7 +1860,9 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
      */
     protected createTableSql(table: Table, createForeignKeys?: boolean): Query {
         const columnDefinitions = table.columns.map(column => this.buildCreateColumnSql(table, column)).join(", ");
-        let sql = `CREATE TABLE ${this.escapePath(table)} (${columnDefinitions}`;
+        const ifNotExists = this.hasIfNotExists() ? "IF NOT EXISTS" : "";
+
+        let sql = `CREATE TABLE ${ifNotExists} ${this.escapePath(table)} (${columnDefinitions}`;
 
         table.columns
             .filter(column => column.isUnique)
@@ -1932,7 +1959,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
     }
 
     protected async insertViewDefinitionSql(view: View): Promise<Query> {
-        const currentSchema = await this.getCurrentSchema()
+        const currentSchema = await this.getCurrentSchema();
         const splittedName = view.name.split(".");
         let schema = this.driver.options.schema || currentSchema;
         let name = view.name;
@@ -1941,7 +1968,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
             name = splittedName[1];
         }
 
-        const type = view.materialized ? "MATERIALIZED_VIEW" : "VIEW"
+        const type = view.materialized ? "MATERIALIZED_VIEW" : "VIEW";
         const expression = typeof view.expression === "string" ? view.expression.trim() : view.expression(this.connection).getQuery();
         const [query, parameters] = this.connection.createQueryBuilder()
             .insert()
@@ -1964,7 +1991,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
      * Builds remove view sql.
      */
     protected async deleteViewDefinitionSql(view: View): Promise<Query> {
-        const currentSchema = await this.getCurrentSchema()
+        const currentSchema = await this.getCurrentSchema();
         const splittedName = view.name.split(".");
         let schema = this.driver.options.schema || currentSchema;
         let name = view.name;
@@ -1973,7 +2000,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
             name = splittedName[1];
         }
 
-        const type = view.materialized ? "MATERIALIZED_VIEW" : "VIEW"
+        const type = view.materialized ? "MATERIALIZED_VIEW" : "VIEW";
         const qb = this.connection.createQueryBuilder();
         const [query, parameters] = qb.delete()
             .from(this.getTypeormMetadataTableName())
@@ -2176,7 +2203,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
         const tableName = table.name.indexOf(".") === -1 ? table.name : table.name.split(".")[1];
         let enumName = column.enumName ? column.enumName : `${tableName}_${column.name.toLowerCase()}_enum`;
         if (schema && withSchema)
-            enumName = `${schema}.${enumName}`
+            enumName = `${schema}.${enumName}`;
         if (toOld)
             enumName = enumName + "_old";
         return enumName.split(".").map(i => {
@@ -2185,7 +2212,7 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
     }
 
     protected async getEnumTypeName(table: Table, column: TableColumn) {
-        const currentSchema = await this.getCurrentSchema()
+        const currentSchema = await this.getCurrentSchema();
         let [schema, name] = table.name.split(".");
         if (!name) {
             name = schema;
@@ -2199,9 +2226,9 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
         // The array type typically has the same name as the base type with the underscore character (_) prepended.
         // ----
         // so, we must remove this underscore character from enum type name
-        let udtName = result[0]["udt_name"]
+        let udtName = result[0]["udt_name"];
         if (udtName.indexOf("_") === 0) {
-            udtName = udtName.substr(1, udtName.length)
+            udtName = udtName.substr(1, udtName.length);
         }
         return {
             enumTypeSchema: result[0]["udt_schema"],
