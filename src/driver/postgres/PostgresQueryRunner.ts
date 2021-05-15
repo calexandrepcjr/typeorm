@@ -79,36 +79,23 @@ export class PostgresQueryRunner extends BaseQueryRunner implements QueryRunner 
         if (this.databaseConnectionPromise)
             return this.databaseConnectionPromise;
 
-        if (this.mode === "slave" && this.driver.isReplicated)  {
-            this.databaseConnectionPromise = this.driver.obtainSlaveConnection().then(([connection, release]: any[]) => {
-                this.driver.connectedQueryRunners.push(this);
-                this.databaseConnection = connection;
+        const driverMethod = this.mode === "slave" && this.driver.isReplicated ?
+            "obtainSlaveConnection" :
+            "obtainMasterConnection";
 
-                const onErrorCallback = () => this.release();
-                this.releaseCallback = () => {
-                    this.databaseConnection.removeListener("error", onErrorCallback);
-                    release();
-                };
-                this.databaseConnection.on("error", onErrorCallback);
+        this.databaseConnectionPromise = this.driver[driverMethod]().then(([connection, release]: any[]) => {
+            this.driver.connectedQueryRunners.push(this);
+            this.databaseConnection = connection;
 
-                return this.databaseConnection;
-            });
+            const onErrorCallback = () => this.release();
+            this.releaseCallback = () => {
+                this.databaseConnection.removeListener("error", onErrorCallback);
+                release();
+            };
+            this.databaseConnection.on("error", onErrorCallback);
 
-        } else { // master
-            this.databaseConnectionPromise = this.driver.obtainMasterConnection().then(([connection, release]: any[]) => {
-                this.driver.connectedQueryRunners.push(this);
-                this.databaseConnection = connection;
-
-                const onErrorCallback = () => this.release();
-                this.releaseCallback = () => {
-                    this.databaseConnection.removeListener("error", onErrorCallback);
-                    release();
-                };
-                this.databaseConnection.on("error", onErrorCallback);
-
-                return this.databaseConnection;
-            });
-        }
+            return this.databaseConnection;
+        });
 
         return this.databaseConnectionPromise;
     }
